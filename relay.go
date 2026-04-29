@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,15 @@ const (
 	maxLastSentEntries       = 10000
 )
 
+var (
+	alertDedupeTimestampPattern  = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	alertDedupeUUIDPattern       = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
+	alertDedupeURLPattern        = regexp.MustCompile(`https?://\S+`)
+	alertDedupeDurationPattern   = regexp.MustCompile(`\b\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)\b`)
+	alertDedupeAlphaNumPattern   = regexp.MustCompile(`\b[A-Za-z0-9]{8,}\b`)
+	alertDedupeLongNumberPattern = regexp.MustCompile(`\b\d{4,}\b`)
+)
+
 type Config struct {
 	SlackWebhookURL string
 	AppName         string
@@ -38,6 +48,22 @@ type Config struct {
 	SuppressWindow  time.Duration
 	MaxRetries      int
 	InitialBackoff  time.Duration
+
+	// StorePath enables persisting every parsed log entry to a SQLite
+	// database at the given path. When empty, no logs are stored and
+	// Handler returns a 503 stub.
+	StorePath string
+
+	// Retention controls how long log rows are kept in the store.
+	// Defaults to 7 days. Cleanup runs on open and opportunistically on insert.
+	Retention time.Duration
+
+	// BasicAuthUser and BasicAuthPass, when both set, gate the Handler
+	// with HTTP Basic authentication. When either is empty, the handler
+	// is served without auth — fine for localhost-only or when fronted
+	// by an auth-aware proxy, but exposes everything otherwise.
+	BasicAuthUser string
+	BasicAuthPass string
 }
 
 type Relay struct {
@@ -51,6 +77,9 @@ type Relay struct {
 	now             func() time.Time
 	mu              sync.Mutex
 	lastSent        map[string]time.Time
+	store           *store
+	basicAuthUser   string
+	basicAuthPass   string
 }
 
 type Entry struct {
@@ -106,7 +135,7 @@ func New(cfg Config) (*Relay, error) {
 		initialBackoff = defaultInitialBackoff
 	}
 
-	return &Relay{
+	relay := &Relay{
 		slackWebhookURL: cfg.SlackWebhookURL,
 		appName:         appName,
 		source:          source,
@@ -116,7 +145,29 @@ func New(cfg Config) (*Relay, error) {
 		initialBackoff:  initialBackoff,
 		now:             time.Now,
 		lastSent:        make(map[string]time.Time),
-	}, nil
+		basicAuthUser:   cfg.BasicAuthUser,
+		basicAuthPass:   cfg.BasicAuthPass,
+	}
+
+	if path := strings.TrimSpace(cfg.StorePath); path != "" {
+		s, err := openStore(path, cfg.Retention)
+		if err != nil {
+			return nil, err
+		}
+		relay.store = s
+	}
+
+	return relay, nil
+}
+
+// Close releases resources held by the relay (currently the log store, if any).
+// Safe to call on a nil receiver. Should be called exactly once after Run
+// returns, typically via defer.
+func (r *Relay) Close() error {
+	if r == nil {
+		return nil
+	}
+	return r.store.Close()
 }
 
 func (r *Relay) Run(ctx context.Context, input io.Reader, stderr io.Writer) error {
@@ -129,9 +180,15 @@ func (r *Relay) Run(ctx context.Context, input io.Reader, stderr io.Writer) erro
 			continue
 		}
 
-		entry, ok := parseEntry(line)
+		entry, rawJSON, ok := parseEntry(line)
 		if !ok {
 			continue
+		}
+
+		if r.store != nil {
+			if err := r.store.Insert(ctx, r.now(), entry, rawJSON); err != nil && stderr != nil {
+				_, _ = fmt.Fprintf(stderr, "logrelay: store insert failed: %v\n", err)
+			}
 		}
 
 		if !shouldAlert(entry.Level) {
@@ -159,7 +216,7 @@ func (r *Relay) Run(ctx context.Context, input io.Reader, stderr io.Writer) erro
 	return nil
 }
 
-func parseEntry(line string) (Entry, bool) {
+func parseEntry(line string) (Entry, string, bool) {
 	var entry Entry
 	jsonLine := line
 	if idx := strings.IndexByte(line, '{'); idx > 0 {
@@ -167,15 +224,15 @@ func parseEntry(line string) (Entry, bool) {
 		jsonLine = line[idx:]
 	}
 	if err := json.Unmarshal([]byte(jsonLine), &entry); err != nil {
-		return Entry{}, false
+		return Entry{}, "", false
 	}
 	if strings.TrimSpace(entry.Level) == "" {
-		return Entry{}, false
+		return Entry{}, "", false
 	}
 	if entry.Message == "" {
 		entry.Message = entry.Msg
 	}
-	return entry, true
+	return entry, jsonLine, true
 }
 
 func shouldAlert(level string) bool {
@@ -374,7 +431,7 @@ func (r *Relay) markSent(entry Entry) {
 func dedupeKey(entry Entry) string {
 	parts := []string{
 		strings.ToLower(strings.TrimSpace(entry.Level)),
-		strings.TrimSpace(entry.Message),
+		normalizeDedupeMessage(entry.Message),
 		strings.TrimSpace(entry.Method),
 		strings.TrimSpace(entry.Path),
 		fmt.Sprintf("%d", entry.StatusCode),
@@ -382,7 +439,33 @@ func dedupeKey(entry Entry) string {
 		strings.TrimSpace(entry.Err),
 		strings.TrimSpace(entry.ErrMessage),
 		strings.TrimSpace(entry.Cause),
-		strings.TrimSpace(entry.Prefix),
+		normalizeDedupeMessage(entry.Prefix),
 	}
 	return strings.Join(parts, "|")
+}
+
+func normalizeDedupeMessage(message string) string {
+	message = strings.TrimSpace(message)
+	message = alertDedupeTimestampPattern.ReplaceAllString(message, "<ts>")
+	message = alertDedupeUUIDPattern.ReplaceAllString(message, "<uuid>")
+	message = alertDedupeURLPattern.ReplaceAllString(message, "<url>")
+	message = alertDedupeDurationPattern.ReplaceAllString(message, "<duration>")
+	message = alertDedupeAlphaNumPattern.ReplaceAllStringFunc(message, normalizeDedupeAlphaNumToken)
+	return alertDedupeLongNumberPattern.ReplaceAllString(message, "<num>")
+}
+
+func normalizeDedupeAlphaNumToken(token string) string {
+	var hasLetter, hasDigit bool
+	for _, r := range token {
+		switch {
+		case r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z':
+			hasLetter = true
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		}
+	}
+	if hasLetter && hasDigit {
+		return "<token>"
+	}
+	return token
 }

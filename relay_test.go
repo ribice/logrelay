@@ -65,7 +65,7 @@ func TestFormatSlackMessageDecodesBase64Stack(t *testing.T) {
 func TestParseEntryStripsDokkuPrefix(t *testing.T) {
 	t.Parallel()
 
-	entry, ok := parseEntry(`2026-04-11T12:00:00Z app[web.1]: {"level":"error","message":"panic recovered","path":"/clubs"}`)
+	entry, _, ok := parseEntry(`2026-04-11T12:00:00Z app[web.1]: {"level":"error","message":"panic recovered","path":"/clubs"}`)
 	if !ok {
 		t.Fatal("expected parseEntry to succeed")
 	}
@@ -160,6 +160,264 @@ func TestRunSuppressesDuplicateAlertsWithinWindow(t *testing.T) {
 	}
 }
 
+func TestRunSuppressesIDVariantAlertsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"[repair] pravosudje vijest id=146808: pravosudje vijest API ne vraća validan odgovor"}`,
+		`{"level":"error","message":"[repair] pravosudje vijest id=146803: pravosudje vijest API ne vraća validan odgovor"}`,
+		`{"level":"error","message":"[repair] pravosudje vijest id=146807: pravosudje vijest API ne vraća validan odgovor"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for id variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesLongNumberVariantAlertsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"[repair] pravosudje vijest article 146808: API ne vraća validan odgovor"}`,
+		`{"level":"error","message":"[repair] pravosudje vijest article 146803: API ne vraća validan odgovor"}`,
+		`{"level":"error","message":"[repair] pravosudje vijest article 146807: API ne vraća validan odgovor"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for long number variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesUUIDVariantAlertsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"job 018f9c2e-7b8d-7e0a-a4e8-c0f83b7fd111 failed: API ne vraća validan odgovor"}`,
+		`{"level":"error","message":"job 018f9c2e-7b8d-7e0a-a4e8-c0f83b7fd222 failed: API ne vraća validan odgovor"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for UUID variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesOpaqueSourceVariantAlertsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"[runonce] create child run failed for source=d7hs2332452s70gltabg: insert scrape run: context canceled"}`,
+		`{"level":"error","message":"[runonce] create child run failed for source=d7hsk3b2452s70gltakg: insert scrape run: context canceled"}`,
+		`{"level":"error","message":"[runonce] create child run failed for source=d7hsm6j2452s70gltapg: insert scrape run: context canceled"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for opaque source variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesURLVariantAlertsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"[doc] https://www.mupzzh.ba/node/436 - direct attachment fetch failed url=https://www.mupzzh.ba/sites/default/files/javne-nabavke/Usluge%20osiguranja.pdf err=status 404"}`,
+		`{"level":"error","message":"[doc] https://www.mupzzh.ba/node/435 - direct attachment fetch failed url=https://www.mupzzh.ba/sites/default/files/javne-nabavke/odluka%20o%20izboru.pdf err=status 404"}`,
+		`{"level":"error","message":"[doc] https://www.mupzzh.ba/node/417 - direct attachment fetch failed url=https://www.mupzzh.ba/sites/default/files/javne-nabavke/Odluka%20tehnicki%20pregled.pdf err=status 404"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for URL variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesPathTokenAndDurationVariantsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"level":"error","message":"/scrape-sources/d7f3n4qnh4rs70u85230 500 13ms"}`,
+		`{"level":"error","message":"/scrape-sources/d7f3n4qnh4rs70u85231 500 27ms"}`,
+		`{"level":"error","message":"/scrape-sources/d7f3n4qnh4rs70u85232 500 91ms"}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for path token and duration variants, got %d", got)
+	}
+}
+
+func TestRunSuppressesDokkuPrefixVariantsWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		SuppressWindow:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	relay.now = func() time.Time { return now }
+
+	input := strings.NewReader(strings.Join([]string{
+		`2026-04-11T12:00:00Z app[web.1]: {"level":"error","message":"db failed","path":"/clubs","status_code":500}`,
+		`2026-04-11T12:00:01Z app[web.1]: {"level":"error","message":"db failed","path":"/clubs","status_code":500}`,
+		`2026-04-11T12:00:02.123456Z app[web.1]: {"level":"error","message":"db failed","path":"/clubs","status_code":500}`,
+	}, "\n"))
+
+	if err := relay.Run(context.Background(), input, io.Discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 slack post for dokku prefix variants, got %d", got)
+	}
+}
+
 func TestRunRetriesSlackPost(t *testing.T) {
 	t.Parallel()
 
@@ -211,8 +469,8 @@ func TestTruncateUTF8Safety(t *testing.T) {
 		{name: "ascii truncated", input: "hello world", max: 5},
 		{name: "multibyte intact", input: "café", max: 10},
 		{name: "multibyte truncated mid-rune", input: "café", max: 4}, // 'é' is 2 bytes at position 3-4
-		{name: "emoji truncated", input: "hi 😀 there", max: 5},       // emoji is 4 bytes
-		{name: "cjk truncated", input: "日本語テスト", max: 7},             // each char is 3 bytes
+		{name: "emoji truncated", input: "hi 😀 there", max: 5},        // emoji is 4 bytes
+		{name: "cjk truncated", input: "日本語テスト", max: 7},              // each char is 3 bytes
 	}
 
 	for _, tt := range tests {
@@ -489,7 +747,7 @@ func TestParseEntryEdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, got := parseEntry(tt.line)
+			_, _, got := parseEntry(tt.line)
 			if got != tt.ok {
 				t.Fatalf("parseEntry(%q) ok = %v, want %v", tt.line, got, tt.ok)
 			}
@@ -520,7 +778,7 @@ func TestParseEntryMsgFallback(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			entry, ok := parseEntry(tt.line)
+			entry, _, ok := parseEntry(tt.line)
 			if !ok {
 				t.Fatal("expected parseEntry to succeed")
 			}

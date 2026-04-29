@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>logrelay</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --error: #f85149;
+    --warn: #d29922;
+    --info: #3fb950;
+    --debug: #8b949e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  header h1 {
+    font-size: 14px;
+    margin: 0 12px 0 0;
+    font-weight: 600;
+  }
+  input, select, button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    font: inherit;
+    border-radius: 4px;
+  }
+  input[type=text] { flex: 1; min-width: 200px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #status { color: var(--muted); margin-left: auto; font-size: 12px; }
+  main { padding: 0 16px 16px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th, td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  tr:hover td { background: var(--panel); }
+  td.ts { color: var(--muted); white-space: nowrap; font-size: 12px; }
+  td.lvl { font-weight: 600; text-transform: uppercase; font-size: 11px; white-space: nowrap; }
+  .lvl-error, .lvl-fatal, .lvl-panic, .lvl-dpanic { color: var(--error); }
+  .lvl-warn { color: var(--warn); }
+  .lvl-info { color: var(--info); }
+  .lvl-debug, .lvl-trace { color: var(--debug); }
+  td.msg { word-break: break-word; }
+  td.msg .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>logrelay</h1>
+  <input type="text" id="q" placeholder="search messages, errors, paths, request_ids…" autofocus>
+  <select id="level">
+    <option value="">all levels</option>
+    <option value="debug">debug</option>
+    <option value="info">info</option>
+    <option value="warn">warn</option>
+    <option value="error">error</option>
+    <option value="fatal">fatal</option>
+    <option value="panic">panic</option>
+  </select>
+  <button id="refresh">refresh</button>
+  <span id="status"></span>
+</header>
+<main>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:170px">time</th>
+        <th style="width:70px">level</th>
+        <th>message</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>no logs match</div>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const rows = $('#rows');
+  const empty = $('#empty');
+  const status = $('#status');
+
+  function fmtTime(nanos) {
+    const d = new Date(nanos / 1e6);
+    const pad = (n, w=2) => String(n).padStart(w, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function escape(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function load() {
+    const params = new URLSearchParams();
+    const q = $('#q').value.trim();
+    const level = $('#level').value;
+    if (q) params.set('q', q);
+    if (level) params.set('level', level);
+    params.set('limit', '300');
+
+    status.textContent = 'loading…';
+    try {
+      const res = await fetch('api/logs?' + params);
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      render(data.logs || []);
+      status.textContent = `${data.logs?.length ?? 0} entries`;
+    } catch (e) {
+      status.textContent = 'error: ' + e.message;
+    }
+  }
+
+  function render(logs) {
+    rows.innerHTML = '';
+    empty.hidden = logs.length > 0;
+    for (const r of logs) {
+      const tr = document.createElement('tr');
+      const meta = [];
+      if (r.method || r.path) meta.push(`${escape(r.method || '')} ${escape(r.path || '')}`.trim());
+      if (r.status_code) meta.push(`status=${r.status_code}`);
+      if (r.host) meta.push(`host=${escape(r.host)}`);
+      if (r.request_id) meta.push(`req=${escape(r.request_id)}`);
+      if (r.error_text) meta.push(`error: ${escape(r.error_text)}`);
+      if (r.prefix) meta.push(escape(r.prefix));
+      tr.innerHTML = `
+        <td class="ts">${fmtTime(r.ts)}</td>
+        <td class="lvl lvl-${escape(r.level)}">${escape(r.level)}</td>
+        <td class="msg">${escape(r.message) || '<span style="color:var(--muted)">(no message)</span>'}${meta.length ? `<div class="meta">${meta.join(' · ')}</div>` : ''}</td>`;
+      rows.appendChild(tr);
+    }
+  }
+
+  $('#refresh').addEventListener('click', load);
+  $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+  $('#level').addEventListener('change', load);
+  let t;
+  $('#q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 250); });
+  load();
+  setInterval(load, 5000);
+</script>
+</body>
+</html>
