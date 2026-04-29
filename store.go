@@ -142,21 +142,20 @@ type LogRow struct {
 }
 
 type queryParams struct {
-	Levels []string // empty = any
-	Query  string   // substring on message + error_text
-	Limit  int
-	Before int64 // id cursor: only return rows with id < Before (0 = no cursor)
+	Levels    []string // empty = any
+	Query     string   // substring on message + error_text + path + request_id
+	Limit     int
+	Before    int64 // id cursor: only return rows with id < Before (0 = no cursor)
+	Since     int64 // unix nano lower bound (inclusive); 0 = no lower bound
+	Until     int64 // unix nano upper bound (exclusive); 0 = no upper bound
+	StatusMin int   // inclusive lower bound on status_code; 0 = no lower bound
+	StatusMax int   // inclusive upper bound on status_code; 0 = no upper bound
 }
 
-func (s *store) Query(ctx context.Context, p queryParams) ([]LogRow, error) {
-	limit := p.Limit
-	if limit <= 0 {
-		limit = storeDefaultQueryLim
-	}
-	if limit > storeMaxQueryLimit {
-		limit = storeMaxQueryLimit
-	}
-
+// buildFilter renders the WHERE clause and args shared by Query and Delete.
+// Returned string is empty when no filters are set; callers should NOT prefix
+// with "WHERE" when empty.
+func (p queryParams) buildFilter() (string, []any) {
 	var (
 		clauses []string
 		args    []any
@@ -175,16 +174,43 @@ func (s *store) Query(ctx context.Context, p queryParams) ([]LogRow, error) {
 		like := "%" + escapeLike(q) + "%"
 		args = append(args, like, like, like, like)
 	}
+	if p.Since > 0 {
+		clauses = append(clauses, "ts >= ?")
+		args = append(args, p.Since)
+	}
+	if p.Until > 0 {
+		clauses = append(clauses, "ts < ?")
+		args = append(args, p.Until)
+	}
+	if p.StatusMin > 0 {
+		clauses = append(clauses, "status_code >= ?")
+		args = append(args, p.StatusMin)
+	}
+	if p.StatusMax > 0 {
+		clauses = append(clauses, "status_code <= ?")
+		args = append(args, p.StatusMax)
+	}
 	if p.Before > 0 {
 		clauses = append(clauses, "id < ?")
 		args = append(args, p.Before)
 	}
 
-	where := ""
-	if len(clauses) > 0 {
-		where = "WHERE " + strings.Join(clauses, " AND ")
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func (s *store) Query(ctx context.Context, p queryParams) ([]LogRow, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = storeDefaultQueryLim
+	}
+	if limit > storeMaxQueryLimit {
+		limit = storeMaxQueryLimit
 	}
 
+	where, args := p.buildFilter()
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, ts, level, message, prefix, method, path, host, request_id, status_code, error_text
@@ -206,6 +232,27 @@ LIMIT ?`, args...)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// Delete removes rows matching the same filter set as Query. Pagination
+// (Limit, Before) is ignored — Delete always operates on the full matching
+// set. With no filters, every row is removed. Returns the number of rows
+// deleted.
+func (s *store) Delete(ctx context.Context, p queryParams) (int64, error) {
+	// Strip pagination — they're meaningful only for reads.
+	p.Limit = 0
+	p.Before = 0
+
+	where, args := p.buildFilter()
+	res, err := s.db.ExecContext(ctx, `DELETE FROM logs `+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete logs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected: %w", err)
+	}
+	return n, nil
 }
 
 func filterEmpty(in []string) []string {

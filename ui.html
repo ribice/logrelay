@@ -46,8 +46,13 @@
     border-radius: 4px;
   }
   input[type=text] { flex: 1; min-width: 200px; }
+  input[type=datetime-local], input[type=number] { width: 150px; }
+  input[type=number] { width: 80px; }
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
+  button.danger { color: var(--error); border-color: var(--error); }
+  button.danger:hover { background: var(--error); color: var(--bg); }
+  label { color: var(--muted); font-size: 12px; }
   #status { color: var(--muted); margin-left: auto; font-size: 12px; }
   main { padding: 0 16px 16px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; }
@@ -83,7 +88,12 @@
     <option value="fatal">fatal</option>
     <option value="panic">panic</option>
   </select>
+  <label>from <input type="datetime-local" id="since" step="1"></label>
+  <label>to <input type="datetime-local" id="until" step="1"></label>
+  <label>status <input type="number" id="status_min" min="0" max="599" placeholder="min"> – <input type="number" id="status_max" min="0" max="599" placeholder="max"></label>
   <button id="refresh">refresh</button>
+  <button id="reset">reset</button>
+  <button id="clear" class="danger" title="Delete logs matching current filters (or all logs if no filters)">clear</button>
   <span id="status"></span>
 </header>
 <main>
@@ -115,12 +125,39 @@
     return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  async function load() {
+  // datetime-local values are interpreted in the browser's local zone; convert
+  // to unix nanos so the server's filter matches what the user picked on screen.
+  function localDatetimeToNanos(value) {
+    if (!value) return null;
+    const ms = new Date(value).getTime();
+    if (Number.isNaN(ms)) return null;
+    return ms * 1e6;
+  }
+
+  function buildParams() {
     const params = new URLSearchParams();
     const q = $('#q').value.trim();
     const level = $('#level').value;
+    const since = localDatetimeToNanos($('#since').value);
+    const until = localDatetimeToNanos($('#until').value);
+    const sMin = $('#status_min').value;
+    const sMax = $('#status_max').value;
     if (q) params.set('q', q);
     if (level) params.set('level', level);
+    if (since !== null) params.set('since', String(since));
+    if (until !== null) params.set('until', String(until));
+    if (sMin) params.set('status_min', sMin);
+    if (sMax) params.set('status_max', sMax);
+    return params;
+  }
+
+  function hasFilters() {
+    const p = buildParams();
+    return [...p.keys()].length > 0;
+  }
+
+  async function load() {
+    const params = buildParams();
     params.set('limit', '300');
 
     status.textContent = 'loading…';
@@ -130,6 +167,36 @@
       const data = await res.json();
       render(data.logs || []);
       status.textContent = `${data.logs?.length ?? 0} entries`;
+    } catch (e) {
+      status.textContent = 'error: ' + e.message;
+    }
+  }
+
+  function resetFilters() {
+    $('#q').value = '';
+    $('#level').value = '';
+    $('#since').value = '';
+    $('#until').value = '';
+    $('#status_min').value = '';
+    $('#status_max').value = '';
+    load();
+  }
+
+  async function clearLogs() {
+    const filtered = hasFilters();
+    const msg = filtered
+      ? 'Delete all log entries matching the current filters? This cannot be undone.'
+      : 'Delete ALL log entries? This cannot be undone.';
+    if (!confirm(msg)) return;
+
+    const params = buildParams();
+    status.textContent = 'deleting…';
+    try {
+      const res = await fetch('api/logs?' + params, { method: 'DELETE' });
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      status.textContent = `deleted ${data.deleted ?? 0}`;
+      load();
     } catch (e) {
       status.textContent = 'error: ' + e.message;
     }
@@ -156,10 +223,17 @@
   }
 
   $('#refresh').addEventListener('click', load);
+  $('#reset').addEventListener('click', resetFilters);
+  $('#clear').addEventListener('click', clearLogs);
   $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
   $('#level').addEventListener('change', load);
+  $('#since').addEventListener('change', load);
+  $('#until').addEventListener('change', load);
   let t;
-  $('#q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 250); });
+  const debounced = () => { clearTimeout(t); t = setTimeout(load, 250); };
+  $('#q').addEventListener('input', debounced);
+  $('#status_min').addEventListener('input', debounced);
+  $('#status_max').addEventListener('input', debounced);
   load();
   setInterval(load, 5000);
 </script>

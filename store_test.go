@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,127 @@ func TestStoreRetentionCleanupByTime(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("expected old entry to be cleaned up, got %d rows", len(rows))
+	}
+}
+
+func TestStoreQueryByTimeRange(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+
+	base := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	for i := range 5 {
+		ts := base.Add(time.Duration(i) * time.Minute)
+		if err := s.Insert(ctx, ts, Entry{Level: "info", Message: "evt"}, ""); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	// Window [+1min, +4min) should match exactly 3 rows (i=1,2,3).
+	rows, err := s.Query(ctx, queryParams{
+		Since: base.Add(time.Minute).UnixNano(),
+		Until: base.Add(4 * time.Minute).UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows in window, got %d", len(rows))
+	}
+}
+
+func TestStoreQueryByStatusRange(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+
+	statuses := []int{200, 302, 400, 404, 500, 503}
+	for i, code := range statuses {
+		if err := s.Insert(ctx, now.Add(time.Duration(i)*time.Second), Entry{Level: "info", Message: "evt", StatusCode: code}, ""); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	// Only 5xx.
+	rows, err := s.Query(ctx, queryParams{StatusMin: 500, StatusMax: 599})
+	if err != nil {
+		t.Fatalf("Query 5xx: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 5xx rows, got %d", len(rows))
+	}
+
+	// 4xx and above.
+	rows, err = s.Query(ctx, queryParams{StatusMin: 400})
+	if err != nil {
+		t.Fatalf("Query >=400: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows >=400, got %d", len(rows))
+	}
+}
+
+func TestStoreDeleteByFilter(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+
+	for i, e := range []Entry{
+		{Level: "info", Message: "noisy"},
+		{Level: "info", Message: "noisy"},
+		{Level: "warn", Message: "slow"},
+		{Level: "error", Message: "boom"},
+	} {
+		if err := s.Insert(ctx, now.Add(time.Duration(i)*time.Second), e, ""); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	deleted, err := s.Delete(ctx, queryParams{Levels: []string{"info"}})
+	if err != nil {
+		t.Fatalf("Delete info: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 deleted, got %d", deleted)
+	}
+
+	rows, err := s.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 remaining, got %d", len(rows))
+	}
+}
+
+func TestStoreDeleteAll(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+
+	for i := range 5 {
+		if err := s.Insert(ctx, now.Add(time.Duration(i)*time.Second), Entry{Level: "info", Message: "x"}, ""); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	deleted, err := s.Delete(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Delete all: %v", err)
+	}
+	if deleted != 5 {
+		t.Fatalf("expected 5 deleted, got %d", deleted)
+	}
+
+	rows, err := s.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected store empty, got %d rows", len(rows))
 	}
 }
 
@@ -267,6 +389,172 @@ func TestHandlerAPILogs(t *testing.T) {
 				t.Fatalf("got %d hits, want %d (%+v)", len(body.Logs), tc.wantHits, body.Logs)
 			}
 		})
+	}
+}
+
+func TestHandlerAPILogsTimeAndStatus(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		StorePath:       filepath.Join(t.TempDir(), "logs.db"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer relay.Close()
+
+	ctx := context.Background()
+	base := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	rows := []struct {
+		offset time.Duration
+		entry  Entry
+	}{
+		{0, Entry{Level: "info", Message: "ok", StatusCode: 200}},
+		{time.Minute, Entry{Level: "warn", Message: "slow", StatusCode: 304}},
+		{2 * time.Minute, Entry{Level: "error", Message: "client error", StatusCode: 404}},
+		{3 * time.Minute, Entry{Level: "error", Message: "boom", StatusCode: 500}},
+	}
+	for _, r := range rows {
+		if err := relay.store.Insert(ctx, base.Add(r.offset), r.entry, ""); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	srv := httptest.NewServer(relay.Handler())
+	defer srv.Close()
+
+	get := func(query string) []LogRow {
+		t.Helper()
+		res, err := http.Get(srv.URL + "/api/logs?" + query)
+		if err != nil {
+			t.Fatalf("GET %s: %v", query, err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d for %q", res.StatusCode, query)
+		}
+		var body struct {
+			Logs []LogRow `json:"logs"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return body.Logs
+	}
+
+	// since= via unix nanos
+	if hits := get("since=" + strconv.FormatInt(base.Add(2*time.Minute).UnixNano(), 10)); len(hits) != 2 {
+		t.Fatalf("since=2min: expected 2, got %d", len(hits))
+	}
+	// until= via unix nanos
+	if hits := get("until=" + strconv.FormatInt(base.Add(2*time.Minute).UnixNano(), 10)); len(hits) != 2 {
+		t.Fatalf("until=2min: expected 2, got %d", len(hits))
+	}
+	// since= via RFC3339
+	if hits := get("since=" + base.Add(time.Minute).Format(time.RFC3339Nano)); len(hits) != 3 {
+		t.Fatalf("since RFC3339: expected 3, got %d", len(hits))
+	}
+	// status_min — only 4xx and 5xx
+	if hits := get("status_min=400"); len(hits) != 2 {
+		t.Fatalf("status_min=400: expected 2, got %d", len(hits))
+	}
+	// 5xx only
+	if hits := get("status_min=500&status_max=599"); len(hits) != 1 {
+		t.Fatalf("5xx: expected 1, got %d", len(hits))
+	}
+	// invalid since
+	res, err := http.Get(srv.URL + "/api/logs?since=not-a-date")
+	if err != nil {
+		t.Fatalf("GET bad since: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad since, got %d", res.StatusCode)
+	}
+}
+
+func TestHandlerAPILogsDelete(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		StorePath:       filepath.Join(t.TempDir(), "logs.db"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer relay.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	for i, e := range []Entry{
+		{Level: "info", Message: "x"},
+		{Level: "info", Message: "y"},
+		{Level: "error", Message: "boom"},
+	} {
+		if err := relay.store.Insert(ctx, now.Add(time.Duration(i)*time.Second), e, ""); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	srv := httptest.NewServer(relay.Handler())
+	defer srv.Close()
+
+	// Delete only info rows.
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/logs?level=info", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+	var body struct {
+		Deleted int64 `json:"deleted"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	res.Body.Close()
+	if body.Deleted != 2 {
+		t.Fatalf("expected 2 deleted, got %d", body.Deleted)
+	}
+
+	// One row remaining.
+	rows, err := relay.store.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Level != "error" {
+		t.Fatalf("expected 1 error row remaining, got %+v", rows)
+	}
+
+	// Delete all (no filters).
+	req, _ = http.NewRequest(http.MethodDelete, srv.URL+"/api/logs", nil)
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE all: %v", err)
+	}
+	res.Body.Close()
+	rows, err = relay.store.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected empty after DELETE all, got %d", len(rows))
 	}
 }
 

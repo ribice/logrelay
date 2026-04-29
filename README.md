@@ -75,8 +75,9 @@ Pipe your application logs:
 
 When `StorePath` is set, every parsed log entry is written to a local SQLite database and `relay.Handler()` returns an `http.Handler` that serves:
 
-- `GET /` — a self-contained, dependency-free HTML search UI (dark theme, level color-coding, live-search debounce, auto-refresh every 5s)
+- `GET /` — a self-contained, dependency-free HTML search UI (dark theme, level color-coding, live-search debounce, time/status range filters, "clear" button, auto-refresh every 5s)
 - `GET /api/logs` — a JSON API the UI calls (also useful for scripting / CLI consumers)
+- `DELETE /api/logs` — deletes rows matching the same filters as `GET`
 
 The UI is a single embedded HTML file (`ui.html`) — no JS bundles, no external assets. By default it serves without authentication; set `BasicAuthUser` and `BasicAuthPass` (see below) to gate it with HTTP Basic auth, or wrap `relay.Handler()` with your own middleware.
 
@@ -156,10 +157,16 @@ http.ListenAndServe(":8080", mux)
 |-------|------|-------------|
 | `level` | string | Comma-separated list of levels (e.g. `error,warn`). Empty = all levels. |
 | `q` | string | Case-insensitive substring search across `message`, `error_text`, `path`, and `request_id`. SQL `LIKE` wildcards (`%`, `_`) are escaped. |
+| `since` | int or RFC3339 | Lower bound on `ts` (inclusive). Accepts either unix nanos or an RFC3339 timestamp (e.g. `2026-04-29T12:00:00Z`). |
+| `until` | int or RFC3339 | Upper bound on `ts` (exclusive). Same formats as `since`. |
+| `status_min` | int | Lower bound on `status_code` (inclusive). Use together with `status_max` to scope to e.g. 5xx. |
+| `status_max` | int | Upper bound on `status_code` (inclusive). |
 | `limit` | int | Max rows to return (default 200, capped at 1000). |
 | `before` | int | Cursor for pagination — returns rows with `id < before`. Use the `id` of the last row from the previous page. |
 
 Each row contains: `id`, `ts` (unix nanos), `level`, `message`, plus optional `prefix`, `method`, `path`, `host`, `request_id`, `status_code`, `error_text`.
+
+`DELETE /api/logs` removes rows matching the same filter set as `GET` (everything except `limit` and `before`). With no parameters, every row is removed. Returns `{"deleted": <int>}`. Always gate this behind auth — the standalone UI's "clear" button confirms before calling, but scripted callers can wipe the store in one request.
 
 ### Behavior notes
 

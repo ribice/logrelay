@@ -6,8 +6,10 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 //go:embed ui.html
@@ -29,6 +31,7 @@ func (r *Relay) Handler() http.Handler {
 		})
 	} else {
 		mux.HandleFunc("GET /api/logs", r.handleAPILogs)
+		mux.HandleFunc("DELETE /api/logs", r.handleAPILogsDelete)
 		mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
 			if req.URL.Path != "/" {
 				http.NotFound(w, req)
@@ -69,8 +72,45 @@ func basicAuth(next http.Handler, user, pass string) http.Handler {
 }
 
 func (r *Relay) handleAPILogs(w http.ResponseWriter, req *http.Request) {
-	q := req.URL.Query()
+	params, err := parseQueryParams(req.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
+	logs, err := r.store.Query(req.Context(), params)
+	if err != nil {
+		http.Error(w, "query failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
+}
+
+// handleAPILogsDelete removes rows matching the same filter set as GET. With
+// no filters, the entire store is wiped — callers should gate this behind
+// auth and ideally a UI confirmation.
+func (r *Relay) handleAPILogsDelete(w http.ResponseWriter, req *http.Request) {
+	params, err := parseQueryParams(req.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	deleted, err := r.store.Delete(req.Context(), params)
+	if err != nil {
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{"deleted": deleted})
+}
+
+func parseQueryParams(q url.Values) (queryParams, error) {
 	params := queryParams{
 		Query: q.Get("q"),
 	}
@@ -92,14 +132,49 @@ func (r *Relay) handleAPILogs(w http.ResponseWriter, req *http.Request) {
 			params.Before = n
 		}
 	}
-
-	logs, err := r.store.Query(req.Context(), params)
-	if err != nil {
-		http.Error(w, "query failed", http.StatusInternalServerError)
-		return
+	if v := strings.TrimSpace(q.Get("since")); v != "" {
+		ns, err := parseTimeParam(v)
+		if err != nil {
+			return queryParams{}, err
+		}
+		params.Since = ns
+	}
+	if v := strings.TrimSpace(q.Get("until")); v != "" {
+		ns, err := parseTimeParam(v)
+		if err != nil {
+			return queryParams{}, err
+		}
+		params.Until = ns
+	}
+	if v := q.Get("status_min"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			params.StatusMin = n
+		}
+	}
+	if v := q.Get("status_max"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			params.StatusMax = n
+		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
+	return params, nil
+}
+
+// parseTimeParam accepts unix-nanos as integer or RFC3339 timestamp and
+// returns unix nanos. Empty input is rejected — callers should check for
+// empty before calling.
+func parseTimeParam(v string) (int64, error) {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return n, nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+		return t.UnixNano(), nil
+	}
+	return 0, &timeParamError{value: v}
+}
+
+type timeParamError struct{ value string }
+
+func (e *timeParamError) Error() string {
+	return "invalid time value " + strconv.Quote(e.value) + ": expected unix nanos or RFC3339"
 }
