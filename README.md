@@ -1,11 +1,11 @@
 # logrelay
 
-A Go library that reads structured JSON log lines from a stream and forwards error-level entries to Slack. Designed to sit between a process's stdout/stderr and your alerting pipeline — pipe your application logs through it and get Slack notifications for errors, panics, and fatal events.
+A Go library that reads structured JSON log lines from a stream, stores them in SQLite, serves a small search UI, and can optionally forward error-level entries to Slack. Designed to sit between a process's stdout/stderr and your internal observability pipeline.
 
 ## Features
 
 - Parses structured JSON logs (supports `message` and `msg` fields for slog/zap/zerolog compatibility)
-- Alerts on `error`, `fatal`, `panic`, and `dpanic` levels
+- Optionally alerts on `error`, `fatal`, `panic`, and `dpanic` levels
 - Deduplicates repeated errors within a configurable suppress window
 - Retries failed Slack posts with exponential backoff and jitter
 - Decodes base64-encoded stack traces
@@ -13,6 +13,8 @@ A Go library that reads structured JSON log lines from a stream and forwards err
 - UTF-8-safe message truncation for Slack's character limits
 - Context-aware — respects cancellation throughout
 - Optional persistent log store (SQLite, pure-Go, no CGO) with a built-in HTML search UI
+- Tags stored logs by app and source so one database can be used as a lightweight multi-system log viewer
+- Optional disk-size cap that prunes oldest stored rows
 
 ## Install
 
@@ -35,9 +37,9 @@ import (
 
 func main() {
 	relay, err := logrelay.New(logrelay.Config{
-		SlackWebhookURL: os.Getenv("SLACK_WEBHOOK_URL"),
 		AppName:         "my-service",
 		Source:          "dokku",
+		StorePath:       "/var/lib/logrelay/logs.db",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -59,7 +61,7 @@ Pipe your application logs:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `SlackWebhookURL` | *(required)* | Slack incoming webhook URL |
+| `SlackWebhookURL` | *(disabled)* | Slack incoming webhook URL. When empty, logrelay still stores and serves logs but skips Slack alerting |
 | `AppName` | `"application"` | Name shown in Slack messages |
 | `Source` | `"logs"` | Source label (e.g. `"dokku"`, `"k8s"`) |
 | `HTTPClient` | `http.DefaultClient` | HTTP client for Slack requests |
@@ -68,6 +70,7 @@ Pipe your application logs:
 | `InitialBackoff` | `500ms` | Initial backoff before first retry |
 | `StorePath` | *(disabled)* | If set, every parsed log entry is written to a SQLite database at this path |
 | `Retention` | `7d` | How long log rows are kept; cleanup runs on startup and opportunistically on insert |
+| `MaxStoreBytes` | *(disabled)* | Optional on-disk SQLite size cap. When exceeded after an insert or cleanup, oldest rows are deleted and the DB is compacted |
 | `BasicAuthUser` | *(disabled)* | If both `BasicAuthUser` and `BasicAuthPass` are set, `Handler()` requires HTTP Basic auth |
 | `BasicAuthPass` | *(disabled)* | See `BasicAuthUser` |
 
@@ -75,8 +78,9 @@ Pipe your application logs:
 
 When `StorePath` is set, every parsed log entry is written to a local SQLite database and `relay.Handler()` returns an `http.Handler` that serves:
 
-- `GET /` — a self-contained, dependency-free HTML search UI (dark theme, level color-coding, live-search debounce, time/status range filters, "clear" button, auto-refresh every 5s)
+- `GET /` — a self-contained, dependency-free HTML search UI (dark theme, app/source dropdown filters, level color-coding, live-search debounce, time/status range filters, expandable raw JSON, "clear" button, pauseable auto-refresh, and "load more" pagination)
 - `GET /api/logs` — a JSON API the UI calls (also useful for scripting / CLI consumers)
+- `GET /api/filters` — distinct app/source values for the UI dropdowns
 - `DELETE /api/logs` — deletes rows matching the same filters as `GET`
 
 The UI is a single embedded HTML file (`ui.html`) — no JS bundles, no external assets. By default it serves without authentication; set `BasicAuthUser` and `BasicAuthPass` (see below) to gate it with HTTP Basic auth, or wrap `relay.Handler()` with your own middleware.
@@ -97,9 +101,8 @@ import (
 
 func main() {
     relay, err := logrelay.New(logrelay.Config{
-        SlackWebhookURL: os.Getenv("SLACK_WEBHOOK_URL"),
-        AppName:         "my-service",
-        StorePath:       "/var/lib/logrelay/logs.db",
+        AppName:   "my-service",
+        StorePath: "/var/lib/logrelay/logs.db",
     })
     if err != nil {
         log.Fatal(err)
@@ -113,7 +116,7 @@ func main() {
         }
     }()
 
-    // Read logs from stdin and forward errors to Slack.
+    // Read logs from stdin and store them for the UI.
     if err := relay.Run(context.Background(), os.Stdin, os.Stderr); err != nil {
         log.Fatal(err)
     }
@@ -156,7 +159,9 @@ http.ListenAndServe(":8080", mux)
 | Param | Type | Description |
 |-------|------|-------------|
 | `level` | string | Comma-separated list of levels (e.g. `error,warn`). Empty = all levels. |
-| `q` | string | Case-insensitive substring search across `message`, `error_text`, `path`, and `request_id`. SQL `LIKE` wildcards (`%`, `_`) are escaped. |
+| `app` | string | Comma-separated list of app/service tags. Empty = all apps. |
+| `source` | string | Comma-separated list of source/system tags. Empty = all sources. |
+| `q` | string | Case-insensitive substring search across `message`, `error_text`, `path`, `request_id`, `app`, and `source`. SQL `LIKE` wildcards (`%`, `_`) are escaped. |
 | `since` | int or RFC3339 | Lower bound on `ts` (inclusive). Accepts either unix nanos or an RFC3339 timestamp (e.g. `2026-04-29T12:00:00Z`). |
 | `until` | int or RFC3339 | Upper bound on `ts` (exclusive). Same formats as `since`. |
 | `status_min` | int | Lower bound on `status_code` (inclusive). Use together with `status_max` to scope to e.g. 5xx. |
@@ -164,14 +169,22 @@ http.ListenAndServe(":8080", mux)
 | `limit` | int | Max rows to return (default 200, capped at 1000). |
 | `before` | int | Cursor for pagination — returns rows with `id < before`. Use the `id` of the last row from the previous page. |
 
-Each row contains: `id`, `ts` (unix nanos), `level`, `message`, plus optional `prefix`, `method`, `path`, `host`, `request_id`, `status_code`, `error_text`.
+Each row contains: `id`, `ts` (unix nanos), `app`, `source`, `level`, `message`, plus optional `prefix`, `method`, `path`, `host`, `request_id`, `status_code`, `error_text`, and `raw`.
+
+`GET /api/filters` returns distinct non-empty app/source values:
+
+```json
+{"apps":["api","worker"],"sources":["dokku","systemd"]}
+```
 
 `DELETE /api/logs` removes rows matching the same filter set as `GET` (everything except `limit` and `before`). With no parameters, every row is removed. Returns `{"deleted": <int>}`. Always gate this behind auth — the standalone UI's "clear" button confirms before calling, but scripted callers can wipe the store in one request.
 
 ### Behavior notes
 
 - The store records **every** parsed entry (all levels), not just the ones forwarded to Slack — so you can search through info/warn logs too.
+- Slack forwarding is disabled when `SlackWebhookURL` is empty.
 - Old rows are deleted on startup and opportunistically on insert based on `Retention` (default 7 days).
+- `MaxStoreBytes` is checked after every insert with lightweight file stats, and enforced immediately when the store is over the limit. Oldest rows are pruned and SQLite is compacted; with an unrealistically tiny limit, all rows may be removed and SQLite may still keep a minimum file size.
 - Without `StorePath`, `relay.Handler()` returns a 503 stub on every request — safe to wire up unconditionally.
 
 ## Log Format
@@ -180,6 +193,10 @@ logrelay expects JSON log lines with at least a `level` field. It recognizes the
 
 ```json
 {
+  "app": "my-service",
+  "service": "my-service",
+  "source": "dokku",
+  "system": "dokku",
   "level": "error",
   "time": "2026-04-11T12:00:00Z",
   "message": "panic recovered",
@@ -197,7 +214,9 @@ logrelay expects JSON log lines with at least a `level` field. It recognizes the
 }
 ```
 
-Lines prefixed with non-JSON text (e.g. Dokku timestamps) are handled automatically — the prefix is extracted and included in the Slack message.
+Lines prefixed with non-JSON text (e.g. Dokku timestamps) are handled automatically — the prefix is extracted and included in stored rows and Slack alerts.
+
+For stored logs, `app` wins over `service`, and `source` wins over `system`. If those fields are absent, logrelay stores the configured `AppName` and `Source` values for the relay instance.
 
 ## License
 

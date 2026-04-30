@@ -32,6 +32,7 @@ func (r *Relay) Handler() http.Handler {
 	} else {
 		mux.HandleFunc("GET /api/logs", r.handleAPILogs)
 		mux.HandleFunc("DELETE /api/logs", r.handleAPILogsDelete)
+		mux.HandleFunc("GET /api/filters", r.handleAPIFilters)
 		mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
 			if req.URL.Path != "/" {
 				http.NotFound(w, req)
@@ -89,6 +90,18 @@ func (r *Relay) handleAPILogs(w http.ResponseWriter, req *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
 }
 
+func (r *Relay) handleAPIFilters(w http.ResponseWriter, req *http.Request) {
+	filters, err := r.store.Filters(req.Context())
+	if err != nil {
+		http.Error(w, "query filters failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(filters)
+}
+
 // handleAPILogsDelete removes rows matching the same filter set as GET. With
 // no filters, the entire store is wiped — callers should gate this behind
 // auth and ideally a UI confirmation.
@@ -119,6 +132,20 @@ func parseQueryParams(q url.Values) (queryParams, error) {
 		for p := range strings.SplitSeq(lvl, ",") {
 			if s := strings.TrimSpace(p); s != "" {
 				params.Levels = append(params.Levels, s)
+			}
+		}
+	}
+	if app := strings.TrimSpace(q.Get("app")); app != "" {
+		for p := range strings.SplitSeq(app, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				params.Apps = append(params.Apps, s)
+			}
+		}
+	}
+	if source := strings.TrimSpace(q.Get("source")); source != "" {
+		for p := range strings.SplitSeq(source, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				params.Sources = append(params.Sources, s)
 			}
 		}
 	}

@@ -41,6 +41,8 @@ var (
 )
 
 type Config struct {
+	// SlackWebhookURL enables Slack alert forwarding when set. Leave empty to
+	// use logrelay only as a local log store and viewer.
 	SlackWebhookURL string
 	AppName         string
 	Source          string
@@ -57,6 +59,11 @@ type Config struct {
 	// Retention controls how long log rows are kept in the store.
 	// Defaults to 7 days. Cleanup runs on open and opportunistically on insert.
 	Retention time.Duration
+
+	// MaxStoreBytes limits the on-disk SQLite store size. When positive,
+	// cleanup deletes oldest rows and compacts the DB until the store is under
+	// this size, or until no rows remain.
+	MaxStoreBytes int64
 
 	// BasicAuthUser and BasicAuthPass, when both set, gate the Handler
 	// with HTTP Basic authentication. When either is empty, the handler
@@ -84,6 +91,10 @@ type Relay struct {
 
 type Entry struct {
 	Prefix       string `json:"-"`
+	App          string `json:"app"`
+	Service      string `json:"service"`
+	Source       string `json:"source"`
+	System       string `json:"system"`
 	Level        string `json:"level"`
 	Time         string `json:"time"`
 	Message      string `json:"message"`
@@ -101,10 +112,6 @@ type Entry struct {
 }
 
 func New(cfg Config) (*Relay, error) {
-	if strings.TrimSpace(cfg.SlackWebhookURL) == "" {
-		return nil, errors.New("slack webhook URL is required")
-	}
-
 	client := cfg.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
@@ -136,7 +143,7 @@ func New(cfg Config) (*Relay, error) {
 	}
 
 	relay := &Relay{
-		slackWebhookURL: cfg.SlackWebhookURL,
+		slackWebhookURL: strings.TrimSpace(cfg.SlackWebhookURL),
 		appName:         appName,
 		source:          source,
 		httpClient:      client,
@@ -150,7 +157,7 @@ func New(cfg Config) (*Relay, error) {
 	}
 
 	if path := strings.TrimSpace(cfg.StorePath); path != "" {
-		s, err := openStore(path, cfg.Retention)
+		s, err := openStoreWithLimit(path, cfg.Retention, cfg.MaxStoreBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -186,9 +193,13 @@ func (r *Relay) Run(ctx context.Context, input io.Reader, stderr io.Writer) erro
 		}
 
 		if r.store != nil {
-			if err := r.store.Insert(ctx, r.now(), entry, rawJSON); err != nil && stderr != nil {
+			if err := r.store.InsertTagged(ctx, r.now(), logAppName(r.appName, entry), logSource(r.source, entry), entry, rawJSON); err != nil && stderr != nil {
 				_, _ = fmt.Fprintf(stderr, "logrelay: store insert failed: %v\n", err)
 			}
+		}
+
+		if r.slackWebhookURL == "" {
+			continue
 		}
 
 		if !shouldAlert(entry.Level) {
@@ -233,6 +244,26 @@ func parseEntry(line string) (Entry, string, bool) {
 		entry.Message = entry.Msg
 	}
 	return entry, jsonLine, true
+}
+
+func logAppName(fallback string, entry Entry) string {
+	if s := strings.TrimSpace(entry.App); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(entry.Service); s != "" {
+		return s
+	}
+	return fallback
+}
+
+func logSource(fallback string, entry Entry) string {
+	if s := strings.TrimSpace(entry.Source); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(entry.System); s != "" {
+		return s
+	}
+	return fallback
 }
 
 func shouldAlert(level string) bool {

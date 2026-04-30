@@ -562,7 +562,7 @@ func TestRunContextCancellation(t *testing.T) {
 	}
 }
 
-func TestNewValidation(t *testing.T) {
+func TestNewAllowsOptionalSlackWebhook(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -570,8 +570,8 @@ func TestNewValidation(t *testing.T) {
 		cfg     Config
 		wantErr bool
 	}{
-		{name: "empty URL", cfg: Config{}, wantErr: true},
-		{name: "whitespace URL", cfg: Config{SlackWebhookURL: "  "}, wantErr: true},
+		{name: "empty URL", cfg: Config{}, wantErr: false},
+		{name: "whitespace URL", cfg: Config{SlackWebhookURL: "  "}, wantErr: false},
 		{name: "valid URL", cfg: Config{SlackWebhookURL: "https://hooks.slack.com/test"}, wantErr: false},
 	}
 
@@ -583,6 +583,24 @@ func TestNewValidation(t *testing.T) {
 				t.Fatalf("New() error = %v, wantErr = %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestRunSkipsSlackWhenWebhookUnset(t *testing.T) {
+	t.Parallel()
+
+	relay, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	input := strings.NewReader(`{"level":"error","message":"boom","error":"db down"}`)
+	if err := relay.Run(context.Background(), input, &stderr); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no slack failure when webhook is unset, got %q", stderr.String())
 	}
 }
 

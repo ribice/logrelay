@@ -5,16 +5,16 @@
 <title>logrelay</title>
 <style>
   :root {
-    --bg: #0e1116;
-    --panel: #161b22;
-    --border: #30363d;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --error: #f85149;
-    --warn: #d29922;
-    --info: #3fb950;
-    --debug: #8b949e;
+    --bg: #101214;
+    --panel: #181a1d;
+    --border: #34383d;
+    --text: #eceff1;
+    --muted: #9aa3aa;
+    --accent: #4fb286;
+    --error: #ff6b5f;
+    --warn: #e5b64f;
+    --info: #62c584;
+    --debug: #9aa3aa;
   }
   * { box-sizing: border-box; }
   body {
@@ -45,9 +45,13 @@
     font: inherit;
     border-radius: 4px;
   }
-  input[type=text] { flex: 1; min-width: 200px; }
+  input[type=text] { min-width: 140px; }
+  input[type=text].search { flex: 1; min-width: 220px; }
+  input[type=text].short { width: 130px; }
+  select.short { width: 150px; }
   input[type=datetime-local], input[type=number] { width: 150px; }
   input[type=number] { width: 80px; }
+  input[type=checkbox] { accent-color: var(--accent); }
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.danger { color: var(--error); border-color: var(--error); }
@@ -65,6 +69,8 @@
   th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
   tr:hover td { background: var(--panel); }
   td.ts { color: var(--muted); white-space: nowrap; font-size: 12px; }
+  td.system { color: var(--text); white-space: nowrap; font-size: 12px; }
+  td.system .sub { color: var(--muted); margin-top: 2px; }
   td.lvl { font-weight: 600; text-transform: uppercase; font-size: 11px; white-space: nowrap; }
   .lvl-error, .lvl-fatal, .lvl-panic, .lvl-dpanic { color: var(--error); }
   .lvl-warn { color: var(--warn); }
@@ -72,13 +78,44 @@
   .lvl-debug, .lvl-trace { color: var(--debug); }
   td.msg { word-break: break-word; }
   td.msg .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  details.raw { margin-top: 6px; color: var(--muted); }
+  details.raw summary { cursor: pointer; display: inline-block; font-size: 12px; }
+  details.raw pre {
+    margin: 6px 0 0;
+    max-height: 280px;
+    overflow: auto;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    white-space: pre-wrap;
+  }
   .empty { color: var(--muted); padding: 24px; text-align: center; }
+  .footer {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: center;
+    padding: 14px 0 0;
+  }
+  .footer label {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>logrelay</h1>
-  <input type="text" id="q" placeholder="search messages, errors, paths, request_ids…" autofocus>
+  <input type="text" id="q" class="search" placeholder="search messages, errors, paths, request_ids, apps…" autofocus>
+  <select id="app" class="short">
+    <option value="">all apps</option>
+  </select>
+  <select id="source" class="short">
+    <option value="">all sources</option>
+  </select>
   <select id="level">
     <option value="">all levels</option>
     <option value="debug">debug</option>
@@ -92,6 +129,7 @@
   <label>to <input type="datetime-local" id="until" step="1"></label>
   <label>status <input type="number" id="status_min" min="0" max="599" placeholder="min"> – <input type="number" id="status_max" min="0" max="599" placeholder="max"></label>
   <button id="refresh">refresh</button>
+  <label><input type="checkbox" id="auto_refresh" checked> live</label>
   <button id="reset">reset</button>
   <button id="clear" class="danger" title="Delete logs matching current filters (or all logs if no filters)">clear</button>
   <span id="status"></span>
@@ -101,6 +139,7 @@
     <thead>
       <tr>
         <th style="width:170px">time</th>
+        <th style="width:140px">system</th>
         <th style="width:70px">level</th>
         <th>message</th>
       </tr>
@@ -108,12 +147,18 @@
     <tbody id="rows"></tbody>
   </table>
   <div id="empty" class="empty" hidden>no logs match</div>
+  <div class="footer">
+    <button id="more" hidden>load more</button>
+  </div>
 </main>
 <script>
   const $ = (s) => document.querySelector(s);
   const rows = $('#rows');
   const empty = $('#empty');
   const status = $('#status');
+  const more = $('#more');
+  const pageLimit = 300;
+  let loadedLogs = [];
 
   function fmtTime(nanos) {
     const d = new Date(nanos / 1e6);
@@ -123,6 +168,15 @@
 
   function escape(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function prettyRaw(raw) {
+    if (!raw) return '';
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {
+      return raw;
+    }
   }
 
   // datetime-local values are interpreted in the browser's local zone; convert
@@ -137,12 +191,16 @@
   function buildParams() {
     const params = new URLSearchParams();
     const q = $('#q').value.trim();
+    const app = $('#app').value;
+    const source = $('#source').value;
     const level = $('#level').value;
     const since = localDatetimeToNanos($('#since').value);
     const until = localDatetimeToNanos($('#until').value);
     const sMin = $('#status_min').value;
     const sMax = $('#status_max').value;
     if (q) params.set('q', q);
+    if (app) params.set('app', app);
+    if (source) params.set('source', source);
     if (level) params.set('level', level);
     if (since !== null) params.set('since', String(since));
     if (until !== null) params.set('until', String(until));
@@ -156,24 +214,66 @@
     return [...p.keys()].length > 0;
   }
 
-  async function load() {
+  async function load({ append = false } = {}) {
     const params = buildParams();
-    params.set('limit', '300');
+    params.set('limit', String(pageLimit));
+    if (append && loadedLogs.length > 0) {
+      params.set('before', String(loadedLogs[loadedLogs.length - 1].id));
+    }
 
     status.textContent = 'loading…';
+    more.disabled = true;
     try {
       const res = await fetch('api/logs?' + params);
       if (!res.ok) throw new Error('http ' + res.status);
       const data = await res.json();
-      render(data.logs || []);
-      status.textContent = `${data.logs?.length ?? 0} entries`;
+      const incoming = data.logs || [];
+      loadedLogs = append ? loadedLogs.concat(incoming) : incoming;
+      render(loadedLogs);
+      more.hidden = incoming.length < pageLimit;
+      status.textContent = `${loadedLogs.length} entries`;
+      if (!append) loadFilters();
     } catch (e) {
       status.textContent = 'error: ' + e.message;
+    } finally {
+      more.disabled = false;
     }
+  }
+
+  async function loadFilters() {
+    try {
+      const res = await fetch('api/filters');
+      if (!res.ok) return;
+      const data = await res.json();
+      populateSelect($('#app'), data.apps || [], 'all apps');
+      populateSelect($('#source'), data.sources || [], 'all sources');
+    } catch {
+      // The filters are convenience controls; log loading still works without them.
+    }
+  }
+
+  function populateSelect(select, values, allLabel) {
+    const current = select.value;
+    select.innerHTML = `<option value="">${allLabel}</option>`;
+    for (const value of values) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      select.appendChild(option);
+    }
+    if (current && !values.includes(current)) {
+      const option = document.createElement('option');
+      option.value = current;
+      option.textContent = current;
+      select.appendChild(option);
+    }
+    select.value = current;
   }
 
   function resetFilters() {
     $('#q').value = '';
+    $('#app').value = '';
+    $('#source').value = '';
     $('#level').value = '';
     $('#since').value = '';
     $('#until').value = '';
@@ -196,6 +296,7 @@
       if (!res.ok) throw new Error('http ' + res.status);
       const data = await res.json();
       status.textContent = `deleted ${data.deleted ?? 0}`;
+      loadFilters();
       load();
     } catch (e) {
       status.textContent = 'error: ' + e.message;
@@ -214,18 +315,31 @@
       if (r.request_id) meta.push(`req=${escape(r.request_id)}`);
       if (r.error_text) meta.push(`error: ${escape(r.error_text)}`);
       if (r.prefix) meta.push(escape(r.prefix));
+      const app = escape(r.app || '');
+      const source = escape(r.source || '');
+      const system = app || source
+        ? `${app || '<span style="color:var(--muted)">-</span>'}${source ? `<div class="sub">${source}</div>` : ''}`
+        : '<span style="color:var(--muted)">-</span>';
+      const raw = r.raw ? `<details class="raw"><summary>raw</summary><pre>${escape(prettyRaw(r.raw))}</pre></details>` : '';
       tr.innerHTML = `
         <td class="ts">${fmtTime(r.ts)}</td>
+        <td class="system">${system}</td>
         <td class="lvl lvl-${escape(r.level)}">${escape(r.level)}</td>
-        <td class="msg">${escape(r.message) || '<span style="color:var(--muted)">(no message)</span>'}${meta.length ? `<div class="meta">${meta.join(' · ')}</div>` : ''}</td>`;
+        <td class="msg">${escape(r.message) || '<span style="color:var(--muted)">(no message)</span>'}${meta.length ? `<div class="meta">${meta.join(' · ')}</div>` : ''}${raw}</td>`;
       rows.appendChild(tr);
     }
   }
 
   $('#refresh').addEventListener('click', load);
+  $('#more').addEventListener('click', () => {
+    $('#auto_refresh').checked = false;
+    load({ append: true });
+  });
   $('#reset').addEventListener('click', resetFilters);
   $('#clear').addEventListener('click', clearLogs);
   $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+  $('#app').addEventListener('change', load);
+  $('#source').addEventListener('change', load);
   $('#level').addEventListener('change', load);
   $('#since').addEventListener('change', load);
   $('#until').addEventListener('change', load);
@@ -234,8 +348,11 @@
   $('#q').addEventListener('input', debounced);
   $('#status_min').addEventListener('input', debounced);
   $('#status_max').addEventListener('input', debounced);
+  loadFilters();
   load();
-  setInterval(load, 5000);
+  setInterval(() => {
+    if ($('#auto_refresh').checked) load();
+  }, 5000);
 </script>
 </body>
 </html>

@@ -2,6 +2,7 @@ package logrelay
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -78,6 +79,131 @@ func TestStoreInsertAndQuery(t *testing.T) {
 	}
 }
 
+func TestStoreQueryByAppAndSource(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+
+	rows := []struct {
+		app    string
+		source string
+		entry  Entry
+	}{
+		{"api", "dokku", Entry{Level: "info", Message: "api started"}},
+		{"worker", "systemd", Entry{Level: "error", Message: "job failed"}},
+		{"api", "systemd", Entry{Level: "warn", Message: "slow request"}},
+	}
+	for i, r := range rows {
+		if err := s.InsertTagged(ctx, now.Add(time.Duration(i)*time.Second), r.app, r.source, r.entry, ""); err != nil {
+			t.Fatalf("InsertTagged(%d): %v", i, err)
+		}
+	}
+
+	api, err := s.Query(ctx, queryParams{Apps: []string{"api"}})
+	if err != nil {
+		t.Fatalf("Query app: %v", err)
+	}
+	if len(api) != 2 {
+		t.Fatalf("expected 2 api rows, got %d", len(api))
+	}
+
+	systemd, err := s.Query(ctx, queryParams{Sources: []string{"systemd"}})
+	if err != nil {
+		t.Fatalf("Query source: %v", err)
+	}
+	if len(systemd) != 2 {
+		t.Fatalf("expected 2 systemd rows, got %d", len(systemd))
+	}
+
+	hits, err := s.Query(ctx, queryParams{Query: "worker"})
+	if err != nil {
+		t.Fatalf("Query worker: %v", err)
+	}
+	if len(hits) != 1 || hits[0].App != "worker" {
+		t.Fatalf("expected one match on app, got %+v", hits)
+	}
+
+	filters, err := s.Filters(ctx)
+	if err != nil {
+		t.Fatalf("Filters: %v", err)
+	}
+	if strings.Join(filters.Apps, ",") != "api,worker" {
+		t.Fatalf("unexpected app filters: %+v", filters.Apps)
+	}
+	if strings.Join(filters.Sources, ",") != "dokku,systemd" {
+		t.Fatalf("unexpected source filters: %+v", filters.Sources)
+	}
+}
+
+func TestStoreQueryIncludesRaw(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, 0)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	raw := `{"level":"info","message":"hello","extra":{"answer":42}}`
+
+	if err := s.Insert(ctx, now, Entry{Level: "info", Message: "hello"}, raw); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	rows, err := s.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Raw != raw {
+		t.Fatalf("expected raw JSON in query result, got %+v", rows)
+	}
+}
+
+func TestStoreMigratesAppAndSourceColumns(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "logs.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    level       TEXT    NOT NULL,
+    message     TEXT    NOT NULL DEFAULT '',
+    prefix      TEXT    NOT NULL DEFAULT '',
+    method      TEXT    NOT NULL DEFAULT '',
+    path        TEXT    NOT NULL DEFAULT '',
+    host        TEXT    NOT NULL DEFAULT '',
+    request_id  TEXT    NOT NULL DEFAULT '',
+    status_code INTEGER NOT NULL DEFAULT 0,
+    error_text  TEXT    NOT NULL DEFAULT '',
+    raw         TEXT    NOT NULL DEFAULT ''
+)`)
+	if err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close old db: %v", err)
+	}
+
+	s, err := openStore(path, 0)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	if err := s.InsertTagged(ctx, time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC), "api", "dokku", Entry{Level: "info", Message: "migrated"}, ""); err != nil {
+		t.Fatalf("InsertTagged: %v", err)
+	}
+	rows, err := s.Query(ctx, queryParams{Apps: []string{"api"}, Sources: []string{"dokku"}})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected migrated row, got %+v", rows)
+	}
+}
+
 func TestStoreRetentionCleanup(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t, time.Hour)
@@ -127,6 +253,32 @@ func TestStoreRetentionCleanupByTime(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("expected old entry to be cleaned up, got %d rows", len(rows))
+	}
+}
+
+func TestStoreMaxBytesPrunesOldestRows(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "logs.db")
+	s, err := openStoreWithLimit(path, 0, 1)
+	if err != nil {
+		t.Fatalf("openStoreWithLimit: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	for i := range 10 {
+		if err := s.Insert(ctx, now.Add(time.Duration(i)*time.Second), Entry{Level: "info", Message: "x"}, strings.Repeat("x", 4096)); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	rows, err := s.Query(ctx, queryParams{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected max-byte pruning to delete all rows under impossible limit, got %d", len(rows))
 	}
 }
 
@@ -297,6 +449,8 @@ func TestRunWritesToStore(t *testing.T) {
 		SlackWebhookURL: server.URL,
 		HTTPClient:      server.Client(),
 		StorePath:       filepath.Join(t.TempDir(), "logs.db"),
+		AppName:         "api",
+		Source:          "dokku",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -304,7 +458,7 @@ func TestRunWritesToStore(t *testing.T) {
 	defer relay.Close()
 
 	input := strings.NewReader(strings.Join([]string{
-		`{"level":"info","message":"starting"}`,
+		`{"level":"info","service":"worker","source":"systemd","message":"starting"}`,
 		`{"level":"error","message":"boom","error":"db down"}`,
 		`{"level":"warn","message":"slow"}`,
 	}, "\n"))
@@ -319,6 +473,12 @@ func TestRunWritesToStore(t *testing.T) {
 	}
 	if len(rows) != 3 {
 		t.Fatalf("expected 3 stored rows (all levels), got %d", len(rows))
+	}
+	if rows[0].App != "api" || rows[0].Source != "dokku" {
+		t.Fatalf("expected default tags on newest row, got app=%q source=%q", rows[0].App, rows[0].Source)
+	}
+	if rows[2].App != "worker" || rows[2].Source != "systemd" {
+		t.Fatalf("expected entry tags to override defaults, got app=%q source=%q", rows[2].App, rows[2].Source)
 	}
 }
 
@@ -477,6 +637,136 @@ func TestHandlerAPILogsTimeAndStatus(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad since, got %d", res.StatusCode)
+	}
+}
+
+func TestHandlerAPILogsAppAndSource(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	relay, err := New(Config{
+		SlackWebhookURL: server.URL,
+		HTTPClient:      server.Client(),
+		StorePath:       filepath.Join(t.TempDir(), "logs.db"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer relay.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	rows := []struct {
+		app    string
+		source string
+		entry  Entry
+	}{
+		{"api", "dokku", Entry{Level: "info", Message: "starting"}},
+		{"worker", "systemd", Entry{Level: "error", Message: "job failed"}},
+		{"api", "systemd", Entry{Level: "warn", Message: "slow"}},
+	}
+	for i, r := range rows {
+		if err := relay.store.InsertTagged(ctx, now.Add(time.Duration(i)*time.Second), r.app, r.source, r.entry, ""); err != nil {
+			t.Fatalf("InsertTagged: %v", err)
+		}
+	}
+
+	srv := httptest.NewServer(relay.Handler())
+	defer srv.Close()
+
+	cases := []struct {
+		query    string
+		wantHits int
+	}{
+		{query: "app=api", wantHits: 2},
+		{query: "source=systemd", wantHits: 2},
+		{query: "app=worker&source=systemd", wantHits: 1},
+		{query: "q=worker", wantHits: 1},
+	}
+	for _, tc := range cases {
+		res, err := http.Get(srv.URL + "/api/logs?" + tc.query)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.query, err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d for %q", res.StatusCode, tc.query)
+		}
+		var body struct {
+			Logs []LogRow `json:"logs"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(body.Logs) != tc.wantHits {
+			t.Fatalf("%q: got %d hits, want %d (%+v)", tc.query, len(body.Logs), tc.wantHits, body.Logs)
+		}
+	}
+}
+
+func TestHandlerAPILogsRawAndFilters(t *testing.T) {
+	t.Parallel()
+
+	relay, err := New(Config{
+		StorePath: filepath.Join(t.TempDir(), "logs.db"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer relay.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	raw := `{"level":"error","message":"boom","extra":{"trace":"abc"}}`
+	if err := relay.store.InsertTagged(ctx, now, "api", "dokku", Entry{Level: "error", Message: "boom"}, raw); err != nil {
+		t.Fatalf("InsertTagged api: %v", err)
+	}
+	if err := relay.store.InsertTagged(ctx, now.Add(time.Second), "worker", "systemd", Entry{Level: "info", Message: "ok"}, `{"level":"info","message":"ok"}`); err != nil {
+		t.Fatalf("InsertTagged worker: %v", err)
+	}
+
+	srv := httptest.NewServer(relay.Handler())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/api/logs?level=error")
+	if err != nil {
+		t.Fatalf("GET logs: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("logs status = %d", res.StatusCode)
+	}
+	var logsBody struct {
+		Logs []LogRow `json:"logs"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&logsBody); err != nil {
+		t.Fatalf("decode logs: %v", err)
+	}
+	if len(logsBody.Logs) != 1 || logsBody.Logs[0].Raw != raw {
+		t.Fatalf("expected raw JSON in API response, got %+v", logsBody.Logs)
+	}
+
+	res, err = http.Get(srv.URL + "/api/filters")
+	if err != nil {
+		t.Fatalf("GET filters: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("filters status = %d", res.StatusCode)
+	}
+	var filters LogFilters
+	if err := json.NewDecoder(res.Body).Decode(&filters); err != nil {
+		t.Fatalf("decode filters: %v", err)
+	}
+	if strings.Join(filters.Apps, ",") != "api,worker" {
+		t.Fatalf("unexpected app filters: %+v", filters.Apps)
+	}
+	if strings.Join(filters.Sources, ",") != "dokku,systemd" {
+		t.Fatalf("unexpected source filters: %+v", filters.Sources)
 	}
 }
 
